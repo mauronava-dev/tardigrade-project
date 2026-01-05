@@ -1,0 +1,392 @@
+# GitLab CI/CD Pipeline Configuration
+# Requirements: 2.1, 2.2, 2.3, 2.4
+
+# Define pipeline stages in execution order
+stages:
+  - quality
+  - test
+  - build
+  - infrastructure
+  - deploy
+
+# Global variables
+variables:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: "3.12"
+  ECR_REPOSITORY: tardigrade
+  TERRAFORM_VERSION: "1.6.0"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+# Cache pip dependencies across jobs
+cache:
+  paths:
+    - .cache/pip/
+    - venv/
+
+# Default image for Python jobs
+default:
+  image: python:${PYTHON_VERSION}
+
+# =============================================================================
+# QUALITY STAGE
+# Requirements: 3.1, 3.2, 3.3, 3.5
+# =============================================================================
+
+# Task 5.2: Black formatter validation
+black:
+  stage: quality
+  script:
+    - pip install black
+    - black --check --diff .
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(staging|dev|main)$/
+
+# Task 5.2: Flake8 linter validation
+flake8:
+  stage: quality
+  script:
+    - pip install flake8
+    - flake8 .
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(staging|dev|main)$/
+
+# Task 5.2: Isort import sorting validation
+isort:
+  stage: quality
+  script:
+    - pip install isort
+    - isort --check-only --diff .
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(staging|dev|main)$/
+
+# =============================================================================
+# TEST STAGE
+# Requirements: 4.1, 4.2, 4.4, 4.5, 4.6
+# =============================================================================
+
+# Task 5.3: Unit tests with coverage
+unit-tests:
+  stage: test
+  needs:
+    - black
+    - flake8
+    - isort
+  script:
+    - pip install -r requirements.txt
+    - pip install -r requirements-dev.txt
+    - pytest --cov=src --cov-report=html --cov-report=xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)/'
+  artifacts:
+    paths:
+      - htmlcov/
+      - coverage.xml
+    expire_in: 7 days
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(staging|dev|main)$/
+
+# =============================================================================
+# BUILD STAGE
+# Requirements: 5.1, 5.2, 5.3, 6.1, 6.3, 6.4
+# =============================================================================
+
+# Task 5.4: Docker build for QA (staging/dev branches)
+docker-build-qa:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  needs:
+    - unit-tests
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    # Task 5.8: AWS authentication with OIDC
+    # Requirements: 9.1, 9.2, 9.4
+    - apk add --no-cache aws-cli python3
+    # OIDC authentication - configure AWS_ROLE_ARN_QA in GitLab CI/CD variables
+    - |
+      aws sts assume-role-with-web-identity \
+        --role-arn ${AWS_ROLE_ARN_QA} \
+        --role-session-name "gitlab-ci-${CI_JOB_ID}" \
+        --web-identity-token ${CI_JOB_JWT_V2} \
+        --duration-seconds 3600 \
+        > /tmp/assume-role-output.json || true
+    - |
+      if [ -f /tmp/assume-role-output.json ]; then
+        export AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('AccessKeyId', ''))" 2>/dev/null || echo "")
+        export AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SecretAccessKey', ''))" 2>/dev/null || echo "")
+        export AWS_SESSION_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SessionToken', ''))" 2>/dev/null || echo "")
+      fi
+    # Fallback to static credentials if OIDC fails (uncomment if needed)
+    # - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    # - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+  script:
+    - BRANCH_NAME=$(echo ${CI_COMMIT_REF_NAME} | sed 's/\//-/g')
+    - IMAGE_TAG_SHA="${BRANCH_NAME}-${CI_COMMIT_SHORT_SHA}"
+    - IMAGE_TAG_LATEST="${BRANCH_NAME}-latest"
+    - ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    - |
+      docker build -f docker/qa/Dockerfile \
+        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG_SHA} \
+        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG_LATEST} \
+        .
+    - docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG_SHA}
+    - docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG_LATEST}
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(staging|dev)$/
+
+# Task 5.4: Docker build for Production (main branch)
+docker-build-prod:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  needs:
+    - unit-tests
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    # Task 5.8: AWS authentication with OIDC
+    # Requirements: 9.1, 9.2, 9.3
+    - apk add --no-cache aws-cli git python3
+    # OIDC authentication - configure AWS_ROLE_ARN_PROD in GitLab CI/CD variables
+    - |
+      aws sts assume-role-with-web-identity \
+        --role-arn ${AWS_ROLE_ARN_PROD} \
+        --role-session-name "gitlab-ci-${CI_JOB_ID}" \
+        --web-identity-token ${CI_JOB_JWT_V2} \
+        --duration-seconds 3600 \
+        > /tmp/assume-role-output.json || true
+    - |
+      if [ -f /tmp/assume-role-output.json ]; then
+        export AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('AccessKeyId', ''))" 2>/dev/null || echo "")
+        export AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SecretAccessKey', ''))" 2>/dev/null || echo "")
+        export AWS_SESSION_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SessionToken', ''))" 2>/dev/null || echo "")
+      fi
+    # Fallback to static credentials if OIDC fails (uncomment if needed)
+    # - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    # - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+  script:
+    - ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    # Get version tag from git
+    - LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+    - VERSION=${LATEST_TAG#v}
+    # Append MR number if this is a merge request
+    - |
+      if [ -n "${CI_MERGE_REQUEST_IID}" ]; then
+        VERSION="${VERSION}-mr${CI_MERGE_REQUEST_IID}"
+      fi
+    - |
+      docker build -f docker/production/Dockerfile \
+        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${VERSION} \
+        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
+        .
+    - docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${VERSION}
+    - docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+
+# =============================================================================
+# INFRASTRUCTURE STAGE
+# Requirements: 8.1, 8.4, 8.5
+# =============================================================================
+
+# Task 5.5: Terraform plan job
+terraform-plan:
+  stage: infrastructure
+  image: hashicorp/terraform:${TERRAFORM_VERSION}
+  needs:
+    - docker-build-prod
+  before_script:
+    # Task 5.8: AWS authentication with OIDC
+    # Requirements: 9.1, 9.2, 9.3
+    - apk add --no-cache aws-cli python3
+    # OIDC authentication
+    - |
+      aws sts assume-role-with-web-identity \
+        --role-arn ${AWS_ROLE_ARN_PROD} \
+        --role-session-name "gitlab-ci-${CI_JOB_ID}" \
+        --web-identity-token ${CI_JOB_JWT_V2} \
+        --duration-seconds 3600 \
+        > /tmp/assume-role-output.json || true
+    - |
+      if [ -f /tmp/assume-role-output.json ]; then
+        export AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('AccessKeyId', ''))" 2>/dev/null || echo "")
+        export AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SecretAccessKey', ''))" 2>/dev/null || echo "")
+        export AWS_SESSION_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SessionToken', ''))" 2>/dev/null || echo "")
+      fi
+    # Fallback to static credentials if OIDC fails (uncomment if needed)
+    # - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    # - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  script:
+    - cd terraform/production
+    - terraform init
+    - terraform validate
+    - terraform plan -out=tfplan
+  artifacts:
+    paths:
+      - terraform/production/tfplan
+    expire_in: 7 days
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+
+# Task 5.5: Terraform apply job (manual)
+terraform-apply:
+  stage: deploy
+  image: hashicorp/terraform:${TERRAFORM_VERSION}
+  needs:
+    - terraform-plan
+  before_script:
+    # AWS authentication with OIDC
+    - apk add --no-cache aws-cli python3
+    - |
+      aws sts assume-role-with-web-identity \
+        --role-arn ${AWS_ROLE_ARN_PROD} \
+        --role-session-name "gitlab-ci-${CI_JOB_ID}" \
+        --web-identity-token ${CI_JOB_JWT_V2} \
+        --duration-seconds 3600 \
+        > /tmp/assume-role-output.json || true
+    - |
+      if [ -f /tmp/assume-role-output.json ]; then
+        export AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('AccessKeyId', ''))" 2>/dev/null || echo "")
+        export AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SecretAccessKey', ''))" 2>/dev/null || echo "")
+        export AWS_SESSION_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SessionToken', ''))" 2>/dev/null || echo "")
+      fi
+    # Fallback to static credentials if OIDC fails (uncomment if needed)
+    # - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    # - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  script:
+    - cd terraform/production
+    - terraform init
+    - terraform apply -auto-approve tfplan
+  environment:
+    name: production
+  when: manual
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+
+# =============================================================================
+# DEPLOY STAGE - ALEMBIC MIGRATIONS
+# Requirements: 7.1, 7.3, 7.4, 7.5
+# =============================================================================
+
+# Task 5.6: Alembic check job
+alembic-check:
+  stage: infrastructure
+  needs:
+    - unit-tests
+  script:
+    - pip install -r requirements.txt
+    - echo "Checking for pending Alembic migrations..."
+    - alembic check || echo "WARNING - Pending migrations detected. Review migration status before deployment."
+  allow_failure: true
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(staging|dev|main)$/
+
+# Task 5.6: Alembic upgrade job (manual) - QA
+alembic-upgrade-qa:
+  stage: deploy
+  needs:
+    - alembic-check
+  before_script:
+    # AWS authentication for database access
+    - pip install awscli
+    - |
+      aws sts assume-role-with-web-identity \
+        --role-arn ${AWS_ROLE_ARN_QA} \
+        --role-session-name "gitlab-ci-${CI_JOB_ID}" \
+        --web-identity-token ${CI_JOB_JWT_V2} \
+        --duration-seconds 3600 \
+        > /tmp/assume-role-output.json || true
+    - |
+      if [ -f /tmp/assume-role-output.json ]; then
+        export AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('AccessKeyId', ''))" 2>/dev/null || echo "")
+        export AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SecretAccessKey', ''))" 2>/dev/null || echo "")
+        export AWS_SESSION_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SessionToken', ''))" 2>/dev/null || echo "")
+      fi
+    # Fallback to static credentials if OIDC fails (uncomment if needed)
+    # - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    # - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  script:
+    - pip install -r requirements.txt
+    - echo "Running Alembic upgrade to head..."
+    - alembic upgrade head
+  environment:
+    name: qa
+  when: manual
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(staging|dev)$/
+
+# Task 5.6: Alembic upgrade job (manual) - Production
+alembic-upgrade-prod:
+  stage: deploy
+  needs:
+    - alembic-check
+  before_script:
+    # AWS authentication for database access
+    - pip install awscli
+    - |
+      aws sts assume-role-with-web-identity \
+        --role-arn ${AWS_ROLE_ARN_PROD} \
+        --role-session-name "gitlab-ci-${CI_JOB_ID}" \
+        --web-identity-token ${CI_JOB_JWT_V2} \
+        --duration-seconds 3600 \
+        > /tmp/assume-role-output.json || true
+    - |
+      if [ -f /tmp/assume-role-output.json ]; then
+        export AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('AccessKeyId', ''))" 2>/dev/null || echo "")
+        export AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SecretAccessKey', ''))" 2>/dev/null || echo "")
+        export AWS_SESSION_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SessionToken', ''))" 2>/dev/null || echo "")
+      fi
+    # Fallback to static credentials if OIDC fails (uncomment if needed)
+    # - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    # - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  script:
+    - pip install -r requirements.txt
+    - echo "Running Alembic upgrade to head..."
+    - alembic upgrade head
+  environment:
+    name: production
+  when: manual
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+
+# Task 5.6: Alembic downgrade job (manual, emergency) - Production only
+alembic-downgrade-prod:
+  stage: deploy
+  needs:
+    - alembic-check
+  before_script:
+    # AWS authentication for database access
+    - pip install awscli
+    - |
+      aws sts assume-role-with-web-identity \
+        --role-arn ${AWS_ROLE_ARN_PROD} \
+        --role-session-name "gitlab-ci-${CI_JOB_ID}" \
+        --web-identity-token ${CI_JOB_JWT_V2} \
+        --duration-seconds 3600 \
+        > /tmp/assume-role-output.json || true
+    - |
+      if [ -f /tmp/assume-role-output.json ]; then
+        export AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('AccessKeyId', ''))" 2>/dev/null || echo "")
+        export AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SecretAccessKey', ''))" 2>/dev/null || echo "")
+        export AWS_SESSION_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/assume-role-output.json')).get('Credentials', {}).get('SessionToken', ''))" 2>/dev/null || echo "")
+      fi
+    # Fallback to static credentials if OIDC fails (uncomment if needed)
+    # - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    # - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  script:
+    - pip install -r requirements.txt
+    - echo "WARNING - Running Alembic downgrade -1 (emergency rollback)..."
+    - alembic downgrade -1
+  environment:
+    name: production
+  when: manual
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
