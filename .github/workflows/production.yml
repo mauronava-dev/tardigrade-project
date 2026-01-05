@@ -7,33 +7,361 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch: # Manual trigger for apply jobs
+  workflow_dispatch:
+    inputs:
+      run_terraform_apply:
+        description: "Run Terraform apply"
+        required: false
+        type: boolean
+        default: false
+      run_alembic_upgrade:
+        description: "Run Alembic upgrade"
+        required: false
+        type: boolean
+        default: false
+      run_alembic_downgrade:
+        description: "Run Alembic downgrade (emergency rollback)"
+        required: false
+        type: boolean
+        default: false
 
 env:
   AWS_REGION: us-east-1
   PYTHON_VERSION: "3.12"
+  ECR_REPOSITORY: tardigrade
+  TERRAFORM_VERSION: "1.6.0"
 
 jobs:
-  # Placeholder for quality checks job
-  # Will be implemented in task 3.1
-
-  # Placeholder for unit tests job
-  # Will be implemented in task 3.1
-
-  # Placeholder for Docker build job
-  # Will be implemented in task 3.2
-
-  # Placeholder for Terraform plan job
-  # Will be implemented in task 3.3
-
-  # Placeholder for Terraform apply job (manual)
-  # Will be implemented in task 3.4
-
-  # Placeholder for Alembic migration jobs
-  # Will be implemented in task 3.5
-
-  placeholder:
+  # Task 3.1: Quality checks job (reused from QA)
+  # Requirements: 3.1, 3.2, 3.3, 3.5
+  quality:
+    name: Code Quality Checks
     runs-on: ubuntu-latest
     steps:
-      - name: Placeholder
-        run: echo "Production pipeline placeholder - jobs will be implemented in subsequent tasks"
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install quality tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install black flake8 isort
+
+      - name: Run black formatter check
+        run: black --check --diff .
+
+      - name: Run flake8 linter
+        run: flake8 .
+
+      - name: Run isort import sorting check
+        run: isort --check-only --diff .
+
+  # Task 3.1: Unit tests job (reused from QA)
+  # Requirements: 4.1, 4.2, 4.4, 4.5, 4.6
+  tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest with coverage
+        run: |
+          pytest --cov=src --cov-report=html --cov-report=xml --cov-fail-under=80
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: htmlcov/
+          retention-days: 7
+
+  # Task 3.2: Docker build job for Production
+  # Requirements: 6.1, 6.3, 6.4, 6.5
+  docker-build:
+    name: Build Docker Image (Production)
+    runs-on: ubuntu-latest
+    needs: [quality, tests]
+    outputs:
+      image_tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for version tagging
+
+      # Task 3.6: AWS authentication with OIDC for production
+      # Requirements: 9.1, 9.2, 9.3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Uncomment below for static credentials fallback if OIDC is not configured
+      # - name: Configure AWS credentials (Static)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract version tag
+        id: version
+        run: |
+          # Try to get the latest tag, default to 0.0.0 if none exists
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          # Remove 'v' prefix if present
+          VERSION=${LATEST_TAG#v}
+          # If this is a PR, append PR number
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            VERSION="${VERSION}-pr${{ github.event.pull_request.number }}"
+          fi
+          echo "tag=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version tag: $VERSION"
+
+      - name: Build Docker image (Production)
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          docker build -f docker/production/Dockerfile \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+
+      - name: Push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  # Task 3.3: Terraform plan job
+  # Requirements: 8.1
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: docker-build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      # AWS authentication for Terraform
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Uncomment below for static credentials fallback if OIDC is not configured
+      # - name: Configure AWS credentials (Static)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: terraform/production
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: terraform/production
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform/production
+        run: terraform plan -out=tfplan
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: terraform/production/tfplan
+          retention-days: 7
+
+  # Task 3.4: Terraform apply job (manual)
+  # Requirements: 8.4, 8.5
+  terraform-apply:
+    name: Terraform Apply (Manual)
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_terraform_apply == 'true'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      # AWS authentication for Terraform
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Uncomment below for static credentials fallback if OIDC is not configured
+      # - name: Configure AWS credentials (Static)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: terraform/production
+        run: terraform init
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: terraform/production
+
+      - name: Terraform Apply
+        working-directory: terraform/production
+        run: terraform apply -auto-approve tfplan
+
+  # Task 3.5: Alembic migration check job
+  # Requirements: 7.1, 7.3, 7.5
+  alembic-check:
+    name: Check Database Migrations
+    runs-on: ubuntu-latest
+    needs: docker-build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check for pending migrations
+        run: |
+          echo "Checking for pending Alembic migrations..."
+          alembic check || echo "::warning::Pending migrations detected. Review migration status before deployment."
+
+  # Task 3.5: Manual Alembic upgrade job for production
+  # Requirements: 7.3, 7.5
+  alembic-upgrade:
+    name: Run Alembic Upgrade (Manual)
+    runs-on: ubuntu-latest
+    needs: alembic-check
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_alembic_upgrade == 'true'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # AWS authentication for database access
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Uncomment below for static credentials fallback if OIDC is not configured
+      # - name: Configure AWS credentials (Static)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Alembic upgrade
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+        run: |
+          echo "Running Alembic upgrade to head..."
+          alembic upgrade head
+
+  # Task 3.5: Manual Alembic downgrade job for production (emergency rollback)
+  # Requirements: 7.4, 7.5
+  alembic-downgrade:
+    name: Run Alembic Downgrade (Emergency)
+    runs-on: ubuntu-latest
+    needs: alembic-check
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_alembic_downgrade == 'true'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # AWS authentication for database access
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Uncomment below for static credentials fallback if OIDC is not configured
+      # - name: Configure AWS credentials (Static)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Alembic downgrade
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+        run: |
+          echo "WARNING: Running Alembic downgrade -1 (emergency rollback)..."
+          alembic downgrade -1
