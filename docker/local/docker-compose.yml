@@ -1,0 +1,72 @@
+# Local Development Docker Compose
+# Includes API, PostgreSQL, and Redis services
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: docker/local/Dockerfile
+    container_name: tardigrade-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../..:/app
+      - /app/venv  # Exclude venv from volume mount
+    environment:
+      - ENVIRONMENT=local
+      - DEBUG=true
+      - LOG_LEVEL=DEBUG
+      - DATABASE_URL=postgresql+asyncpg://tardigrade:tardigrade@postgres:5432/tardigrade
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET_KEY=local-development-secret-key-change-in-production
+      - ACCESS_TOKEN_EXPIRE_MINUTES=15
+      - REFRESH_TOKEN_EXPIRE_DAYS=7
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tardigrade-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tardigrade-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=tardigrade
+      - POSTGRES_PASSWORD=tardigrade
+      - POSTGRES_DB=tardigrade
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tardigrade -d tardigrade"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tardigrade-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: tardigrade-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tardigrade-network
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  tardigrade-network:
+    driver: bridge
