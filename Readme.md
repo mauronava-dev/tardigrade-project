@@ -66,6 +66,17 @@ El CI/CD de Gitlab y Github deben estar orientados a
 - Prepara `terraform apply` como un trigger manual
 - El MR sólo puede ser aceptado si `terraform plan` fue exitoso.
 
+Cualquier paso o job de los pipelines de CI/CD deben de considerar que el repositorio de código está enlazado con OIDC para los despliegues de recursos, y debe dejar comentada la opción de obtener las credenciales por medio de variables de entorno.
 
 En terraform se deben de incluir los servicios básicos de AWS para el desarrollo y despliegue del API.
 Los archivos de configuración de terraform deben estar organizados con archivos independientes por cada servicio, así facilitando el trabajo para los desarrolladores.
+
+## Desarrollo
+
+El proyecto debe incluir una carpeta `scripts` en los que se encuentren los archivos necesarios para cada miembro del proyecto pueda interactuar con el proyecto, por ejemplo:
+
+- `scripts/setup.sh`: Crea el entorno virtual si no existe, instala las dependencias y prepara los githooks.
+- `scripts/run.sh`: Ejecuta el proyecto en modo desarrollo.
+- `scripts/test.sh`: Ejecuta las pruebas unitarias.
+- `scripts/terraform.sh`: Ejecuta terraform.
+- `scripts/init-terraform.sh`: Inicualiza terraform. Está pensado para ser ejecutado una sola vez por el líder técnico para preparar los despliegues.
