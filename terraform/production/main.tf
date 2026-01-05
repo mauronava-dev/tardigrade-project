@@ -11,15 +11,7 @@ terraform {
     }
   }
 
-  # S3 backend for state management
-  # Uncomment and configure for your AWS account
-  # backend "s3" {
-  #   bucket         = "tardigrade-terraform-state"
-  #   key            = "production/terraform.tfstate"
-  #   region         = "us-east-1"
-  #   encrypt        = true
-  #   dynamodb_table = "tardigrade-terraform-locks"
-  # }
+  # Backend configuration is in backend.tf
 }
 
 # AWS Provider configuration
