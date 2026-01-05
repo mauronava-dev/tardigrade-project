@@ -1,0 +1,267 @@
+# Cursor Rules - Tardigrade Project
+
+You are an expert Python backend developer working on the Tardigrade Project, a production-ready template following hexagonal architecture.
+
+## Tech Stack
+
+- Python 3.12
+- FastAPI (async API development)
+- SQLAlchemy (async ORM)
+- Alembic (migrations)
+- pytest (testing)
+- structlog (logging)
+- Docker & Terraform (infrastructure)
+- Amazon Bedrock (AI agents)
+
+## Code Style
+
+- Language: English (code, comments, docs)
+- Line length: 120 characters
+- Indentation: 4 spaces
+- Quotes: double quotes (`"`)
+- Naming: `snake_case` (vars/funcs), `PascalCase` (classes), `UPPER_SNAKE_CASE` (constants)
+- Type hints: required on all functions
+- Docstrings: Google-style format
+
+## Architecture (Hexagonal)
+
+```
+src/
+├── domain/           # Pure business logic, NO external deps
+│   ├── entities/
+│   ├── services/
+│   └── exceptions/
+├── application/      # Use cases, port definitions
+│   ├── use_cases/
+│   └── interfaces/
+├── infrastructure/   # Adapters (DB, API, external services)
+│   ├── database/
+│   ├── api/
+│   └── external/
+└── shared/           # Utilities
+```
+
+Dependencies flow inward: infrastructure → application → domain
+
+## SQL Optimization (CRITICAL)
+
+Follow: Filter → Project → Aggregate → Join → Order
+
+### DO:
+```python
+# Select specific columns
+select(User.id, User.email, User.name)
+
+# Filter early in subqueries
+filtered = select(Order.customer_id, func.sum(Order.amount).label("total"))
+    .where(Order.created_at >= start_date)
+    .group_by(Order.customer_id)
+    .subquery()
+
+# Use EXISTS for existence checks
+select(Customer).where(exists(select(Order.id).where(Order.customer_id == Customer.id)))
+
+# Batch operations
+await session.execute(insert(User), users_list)
+
+# Keyset pagination for large datasets
+select(Product).where(Product.id > last_id).order_by(Product.id).limit(20)
+```
+
+### DON'T:
+```python
+# ❌ SELECT *
+select(User)
+
+# ❌ Functions on indexed columns
+select(Order).where(func.year(Order.created_at) == 2025)
+
+# ❌ IN with subqueries (use EXISTS)
+select(Customer).where(Customer.id.in_(select(Order.customer_id)))
+
+# ❌ N+1 queries
+for user in users:
+    orders = await get_orders(user.id)  # Bad!
+```
+
+## Function Template
+
+```python
+async def process_order(
+    session: AsyncSession,
+    order_id: int,
+    discount: float = 0.0
+) -> OrderResult:
+    """
+    Process an order and apply discount.
+
+    Args:
+        session: Database session.
+        order_id: Order identifier.
+        discount: Discount percentage (0.0 to 1.0).
+
+    Returns:
+        Processed order result.
+
+    Raises:
+        OrderNotFoundError: If order doesn't exist.
+        InvalidDiscountError: If discount is out of range.
+    """
+    if not 0.0 <= discount <= 1.0:
+        raise InvalidDiscountError(f"Discount must be 0-1, got {discount}")
+
+    order = await get_order_by_id(session, order_id)
+    if not order:
+        raise OrderNotFoundError(order_id)
+
+    return await apply_discount(order, discount)
+```
+
+## FastAPI Endpoint Template
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+router = APIRouter(prefix="/api/v1/orders", tags=["Orders"])
+
+
+class OrderCreate(BaseModel):
+    """Schema for order creation."""
+
+    product_id: int = Field(..., description="Product identifier")
+    quantity: int = Field(..., ge=1, le=100)
+
+
+class OrderResponse(BaseModel):
+    """Schema for order response."""
+
+    id: int
+    product_id: int
+    quantity: int
+    total: float
+
+
+@router.post(
+    "/",
+    response_model=OrderResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create order",
+    responses={
+        201: {"description": "Order created"},
+        400: {"description": "Invalid input"},
+        404: {"description": "Product not found"},
+    },
+)
+async def create_order(
+    order: OrderCreate,
+    current_user: dict = Depends(get_current_user),
+) -> OrderResponse:
+    """Create a new order for the authenticated user."""
+    pass
+```
+
+## Repository Pattern
+
+```python
+from abc import ABC, abstractmethod
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+
+class Repository(ABC, Generic[T]):
+    """Base repository interface."""
+
+    @abstractmethod
+    async def get_by_id(self, id: str) -> T | None:
+        pass
+
+    @abstractmethod
+    async def save(self, entity: T) -> T:
+        pass
+
+    @abstractmethod
+    async def delete(self, id: str) -> bool:
+        pass
+```
+
+## Testing
+
+- Framework: pytest + pytest-asyncio
+- Coverage: minimum 80%
+- Structure: mirror src/ in tests/
+
+```python
+import pytest
+from httpx import AsyncClient, ASGITransport
+
+
+@pytest.fixture
+async def client():
+    """Async test client."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.mark.asyncio
+async def test_create_order(client: AsyncClient):
+    """Test order creation."""
+    response = await client.post(
+        "/api/v1/orders",
+        json={"product_id": 1, "quantity": 2}
+    )
+    assert response.status_code == 201
+    assert response.json()["quantity"] == 2
+```
+
+## Environment Variables
+
+```python
+import os
+
+# Always use getenv with defaults
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://localhost:5432/dev")
+API_PORT = int(os.getenv("API_PORT", "8000"))
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "local")
+```
+
+## Logging
+
+```python
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+# Structured logging
+logger.info("order_created", order_id=123, user_id=456)
+logger.error("payment_failed", order_id=123, reason="insufficient_funds")
+```
+
+## Authentication
+
+JWT with access (15min) + refresh (7 days) tokens:
+
+```python
+@router.get("/profile")
+async def get_profile(user: dict = Depends(get_current_user)):
+    """Protected endpoint."""
+    return user
+```
+
+## Scripts
+
+```bash
+./scripts/setup.sh      # Setup environment
+./scripts/run.sh        # Start dev server
+./scripts/test.sh       # Run tests
+./scripts/migrate.sh    # Database migrations
+./scripts/terraform.sh  # Infrastructure
+```
+
+## Additional Context
+
+Check `docs/user/` for project-specific documentation (business rules, API specs, etc.).
