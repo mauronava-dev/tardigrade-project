@@ -18,9 +18,7 @@ class Settings:
     """
 
     # Database Configuration
-    database_url: str = os.getenv(
-        "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/tardigrade"
-    )
+    database_url: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/tardigrade")
 
     # API Configuration
     api_port: int = int(os.getenv("API_PORT", "8000"))

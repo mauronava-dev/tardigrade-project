@@ -57,9 +57,7 @@ class LLMPort(ABC):
         pass
 
     @abstractmethod
-    async def invoke_with_history(
-        self, prompt: PromptTemplate, messages: list[dict], user_input: str
-    ) -> str:
+    async def invoke_with_history(self, prompt: PromptTemplate, messages: list[dict], user_input: str) -> str:
         """Invoke LLM with conversation history.
 
         Args:

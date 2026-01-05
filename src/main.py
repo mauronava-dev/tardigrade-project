@@ -4,7 +4,7 @@ This module configures and creates the FastAPI application with all routers,
 middleware, and exception handlers.
 """
 
-import os
+# import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse

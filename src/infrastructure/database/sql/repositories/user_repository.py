@@ -76,9 +76,7 @@ class SQLUserRepository(UserRepositoryPort):
         Returns:
             The User entity if found, None otherwise.
         """
-        result = await self.session.execute(
-            select(UserModel).where(UserModel.id == user_id)
-        )
+        result = await self.session.execute(select(UserModel).where(UserModel.id == user_id))
         model = result.scalar_one_or_none()
         return self._to_entity(model) if model else None
 
@@ -91,9 +89,7 @@ class SQLUserRepository(UserRepositoryPort):
         Returns:
             The User entity if found, None otherwise.
         """
-        result = await self.session.execute(
-            select(UserModel).where(UserModel.email == email)
-        )
+        result = await self.session.execute(select(UserModel).where(UserModel.email == email))
         model = result.scalar_one_or_none()
         return self._to_entity(model) if model else None
 
@@ -117,9 +113,7 @@ class SQLUserRepository(UserRepositoryPort):
             return self._to_entity(model)
         else:
             # Update existing user
-            result = await self.session.execute(
-                select(UserModel).where(UserModel.id == user.id)
-            )
+            result = await self.session.execute(select(UserModel).where(UserModel.id == user.id))
             model = result.scalar_one_or_none()
             if model:
                 model.email = user.email
@@ -145,9 +139,7 @@ class SQLUserRepository(UserRepositoryPort):
         Returns:
             True if the user was deleted, False if user was not found.
         """
-        result = await self.session.execute(
-            select(UserModel).where(UserModel.id == user_id)
-        )
+        result = await self.session.execute(select(UserModel).where(UserModel.id == user_id))
         model = result.scalar_one_or_none()
         if model:
             await self.session.delete(model)
@@ -165,8 +157,6 @@ class SQLUserRepository(UserRepositoryPort):
         Returns:
             List of User entities.
         """
-        result = await self.session.execute(
-            select(UserModel).offset(skip).limit(limit)
-        )
+        result = await self.session.execute(select(UserModel).offset(skip).limit(limit))
         models = result.scalars().all()
         return [self._to_entity(model) for model in models]
